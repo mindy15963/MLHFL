@@ -540,6 +540,103 @@ def get_model(model_type: str, input_dim: int, num_classes: int):
                 _, (h_n, _) = self.lstm(x)
                 return self.fc(h_n.squeeze(0))
         return LSTMModel(input_dim, num_classes=num_classes)
+    elif model_type == "vae":
+        class VAEClassifier(nn.Module):
+            """
+            [Variational Autoencoder for Classification]
+            
+            VAE는 데이터의 잠재 표현(latent representation)을 학습하여
+            의료 데이터의 복잡한 패턴을 포착합니다.
+            
+            구조:
+            1. Encoder: 입력 → 잠재 공간(평균, 분산)
+            2. Reparameterization: 잠재 벡터 샘플링
+            3. Decoder: 잠재 벡터 → 재구성
+            4. Classifier: 잠재 벡터 → 클래스 예측
+            
+            장점:
+            - 데이터의 본질적 특징 추출
+            - 노이즈에 강건함
+            - 정규화 효과 (KL divergence)
+            - Non-IID 데이터 처리 우수
+            """
+            def __init__(self, input_dim, latent_dim=16, num_classes=2):
+                super().__init__()
+                
+                # [1] Encoder: 입력 → 잠재 공간
+                self.encoder = nn.Sequential(
+                    nn.Linear(input_dim, 64),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(64),
+                    nn.Dropout(0.2),
+                    nn.Linear(64, 32),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(32)
+                )
+                
+                # [2] 잠재 공간 파라미터 (평균과 로그 분산)
+                self.fc_mu = nn.Linear(32, latent_dim)  # 평균
+                self.fc_logvar = nn.Linear(32, latent_dim)  # 로그 분산
+                
+                # [3] Decoder: 잠재 벡터 → 재구성
+                self.decoder = nn.Sequential(
+                    nn.Linear(latent_dim, 32),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(32),
+                    nn.Linear(32, 64),
+                    nn.ReLU(),
+                    nn.BatchNorm1d(64),
+                    nn.Linear(64, input_dim)  # 입력 차원으로 복원
+                )
+                
+                # [4] Classifier: 잠재 벡터 → 클래스 예측
+                self.classifier = nn.Sequential(
+                    nn.Linear(latent_dim, 16),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(16, num_classes)
+                )
+                
+                self.latent_dim = latent_dim
+            
+            def encode(self, x):
+                """Encoder: 입력을 잠재 공간의 평균과 분산으로 변환"""
+                h = self.encoder(x)
+                mu = self.fc_mu(h)
+                logvar = self.fc_logvar(h)
+                return mu, logvar
+            
+            def reparameterize(self, mu, logvar):
+                """
+                Reparameterization Trick
+                z = μ + σ * ε (ε ~ N(0, 1))
+                """
+                std = torch.exp(0.5 * logvar)
+                eps = torch.randn_like(std)
+                return mu + eps * std
+            
+            def decode(self, z):
+                """Decoder: 잠재 벡터를 원본 입력으로 재구성"""
+                return self.decoder(z)
+            
+            def forward(self, x, return_recon=False):
+                """
+                순전파
+                return_recon=True: (예측, 재구성, 평균, 로그분산) 반환
+                return_recon=False: 예측만 반환 (평가 시)
+                """
+                mu, logvar = self.encode(x)
+                z = self.reparameterize(mu, logvar)
+                
+                if return_recon:
+                    recon = self.decode(z)
+                    pred = self.classifier(z)
+                    return pred, recon, mu, logvar
+                else:
+                    pred = self.classifier(z)
+                    return pred
+        
+        return VAEClassifier(input_dim, latent_dim=16, num_classes=num_classes)
     else:
         raise ValueError(f"지원하지 않는 모델: {model_type}")
 # ============================================================
@@ -2361,7 +2458,7 @@ if __name__ == "__main__":
     
     # 모델: 로지스틱 회귀(lr)만 사용 (간단하고 빠름)
     # LSTM(lstm), Random Forest(rf)도 가능하지만 시간이 오래 걸림
-    models = ["secureboost"] # "lr", "lstm", "rf", "svm", "secureboost"
+    models = ["vae"] # "lr", "lstm", "rf", "svm", "secureboost", "vae"
     
     # [2] 연합학습 타입: 두 가지 방식 비교
     # existing_hybrid: 기존 방식 (지역 서버 없음, 에폭5, 학습률0.001)
