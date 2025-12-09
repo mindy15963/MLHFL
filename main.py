@@ -23,6 +23,7 @@ import copy
 import time
 warnings.filterwarnings("ignore")
 import xgboost as xgb  # SecureBoost를 위한 XGBoost 추가
+import lightgbm as lgb
 # ============================================================
 # 1. 시스템 설정 및 상수 정의
 # ============================================================
@@ -1265,6 +1266,212 @@ class LightweightSecureBoostClient(fl.client.NumPyClient):
         }
 
         return 0.0, len(self.y_val), metrics
+class LightweightLGBMClient(fl.client.NumPyClient):
+    """
+    LightGBM Client for Federated Learning
+    
+    [핵심 특징]
+    - XGBoost보다 2~10배 빠른 학습 속도
+    - 메모리 효율적 (Histogram 기반 알고리즘)
+    - 의료 데이터(Tabular)에 최적화
+    - 불균형 클래스 처리 우수
+    
+    [연합학습 전략]
+    - Feature importance 기반 파라미터 공유
+    - 지역별 앙상블 구조 활용
+    - 신뢰도 기반 가중치 적용
+    """
+    def __init__(self, profile: ClientProfile, X_train, y_train, X_val, y_val):
+        self.profile = profile
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
+        
+        # 참여 수준에 따른 학습량 조정
+        participation = profile.determine_participation()
+        if participation == ParticipationLevel.FULL:
+            self.n_estimators = 100  # 충분한 트리 개수
+        elif participation == ParticipationLevel.PARTIAL:
+            self.n_estimators = 50   # 절반
+        else:  # DELEGATED
+            self.n_estimators = 25   # 최소
+        
+        # LightGBM 하이퍼파라미터 (의료 데이터 최적화)
+        self.params = {
+            'objective': 'binary',           # 이진 분류
+            'metric': 'auc',                 # AUC 최적화 (불균형 데이터)
+            'boosting_type': 'gbdt',         # Gradient Boosting Decision Tree
+            'num_leaves': 31,                # 트리 복잡도 (2^5 - 1)
+            'learning_rate': 0.05,           # 학습률 (작을수록 안정)
+            'feature_fraction': 0.9,         # Feature 샘플링 (과적합 방지)
+            'bagging_fraction': 0.8,         # 데이터 샘플링
+            'bagging_freq': 5,               # 배깅 빈도
+            'min_data_in_leaf': 5,           # 리프 최소 샘플 (의료 데이터)
+            'max_depth': 6,                  # 최대 깊이 (과적합 방지)
+            'verbose': -1,                   # 로그 끄기
+            'seed': 42,                      # 재현성
+            'is_unbalance': True             # 불균형 데이터 처리 ⭐
+        }
+        
+        self.model = None
+        self.is_fitted = False
+    
+    def get_parameters(self, config):
+        """
+        모델 파라미터 추출
+        
+        [LightGBM FL 전략]
+        - Feature importance를 파라미터로 사용
+        - Tree 구조 자체는 공유 안함 (복잡도 회피)
+        - FedAvg로 feature importance 평균화
+        """
+        if self.is_fitted and self.model is not None:
+            # Feature importance를 파라미터로 반환
+            feature_importance = self.model.feature_importance(importance_type='gain')
+            return [feature_importance.astype(np.float32)]
+        
+        # 초기값 (zeros)
+        return [np.zeros(self.X_train.shape[1], dtype=np.float32)]
+    
+    def set_parameters(self, parameters):
+        """
+        글로벌 파라미터 수신
+        
+        [주의]
+        - LightGBM은 Tree 기반이라 파라미터 직접 설정 어려움
+        - Feature importance만 참고용으로 저장
+        - 실제 학습은 로컬 데이터로만 수행
+        """
+        if len(parameters) > 0:
+            # Feature importance 저장 (다음 라운드 참고용)
+            self.global_feature_importance = parameters[0]
+    
+    def fit(self, parameters, config):
+        """
+        로컬 모델 학습
+        
+        [LightGBM 학습 전략]
+        1. 글로벌 feature importance 수신 (선택적 활용)
+        2. 로컬 데이터로 LightGBM 학습
+        3. Feature importance 반환
+        4. 신뢰도 점수 업데이트
+        """
+        self.set_parameters(parameters)
+        
+        # 참여 수준에 따른 데이터 크기 조정
+        participation = self.profile.determine_participation()
+        if participation == ParticipationLevel.DELEGATED:
+            # DELEGATED: 절반 데이터로만 학습 (빠른 처리)
+            train_size = len(self.X_train) // 2
+            X_train_use = self.X_train[:train_size]
+            y_train_use = self.y_train[:train_size]
+        else:
+            X_train_use = self.X_train
+            y_train_use = self.y_train
+        
+        # LightGBM Dataset 생성
+        train_data = lgb.Dataset(X_train_use, label=y_train_use)
+        
+        # 검증 데이터 (Early Stopping용)
+        if len(self.X_val) > 0:
+            val_data = lgb.Dataset(self.X_val, label=self.y_val, reference=train_data)
+            valid_sets = [train_data, val_data]
+            valid_names = ['train', 'valid']
+        else:
+            valid_sets = [train_data]
+            valid_names = ['train']
+        
+        # 🚀 LightGBM 학습
+        self.model = lgb.train(
+            self.params,
+            train_data,
+            num_boost_round=self.n_estimators,
+            valid_sets=valid_sets,
+            valid_names=valid_names,
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=10, verbose=False),
+                lgb.log_evaluation(period=0)  # 로그 끄기
+            ]
+        )
+        
+        self.is_fitted = True
+        
+        # 검증 손실 계산 (신뢰도 업데이트용)
+        if len(self.X_val) > 0:
+            y_pred = self.model.predict(self.X_val)
+            y_pred_binary = (y_pred > 0.5).astype(int)
+            val_acc = float(accuracy_score(self.y_val, y_pred_binary))
+            model_loss = 1.0 - val_acc
+        else:
+            model_loss = None
+        
+        # 신뢰도 점수 업데이트
+        self.profile.update_trust_score(success=True, model_loss=model_loss)
+        
+        return self.get_parameters(config={}), len(X_train_use), {}
+    
+    def evaluate(self, parameters, config):
+        """
+        모델 평가
+        
+        [평가 지표]
+        - Accuracy: 전체 정확도
+        - Precision: 오진 최소화
+        - Recall: 질병 놓침 방지
+        - F1 Score: 균형 지표
+        - AUC: 불균형 데이터 평가 (추가 가능)
+        """
+        self.set_parameters(parameters)
+        
+        # 모델이 없으면 학습
+        if not self.is_fitted or self.model is None:
+            train_data = lgb.Dataset(self.X_train, label=self.y_train)
+            self.model = lgb.train(
+                self.params,
+                train_data,
+                num_boost_round=self.n_estimators,
+                callbacks=[lgb.log_evaluation(period=0)]
+            )
+            self.is_fitted = True
+        
+        # 검증 데이터 없으면 종료
+        if len(self.y_val) == 0:
+            return 0.0, 0, {}
+        
+        # 예측
+        y_pred_prob = self.model.predict(self.X_val)
+        y_pred = (y_pred_prob > 0.5).astype(int)
+        
+        # 성능 지표 계산
+        acc = float(accuracy_score(self.y_val, y_pred))
+        
+        # 클래스 확인
+        unique_true = len(np.unique(self.y_val))
+        unique_pred = len(np.unique(y_pred))
+        
+        if unique_true <= 1 or unique_pred <= 1:
+            prec = rec = f1 = acc
+        else:
+            try:
+                prec = float(precision_score(self.y_val, y_pred, average='binary', zero_division=0))
+                rec = float(recall_score(self.y_val, y_pred, average='binary', zero_division=0))
+                f1 = float(f1_score(self.y_val, y_pred, average='binary', zero_division=0))
+            except:
+                prec = float(precision_score(self.y_val, y_pred, average='macro', zero_division=0))
+                rec = float(recall_score(self.y_val, y_pred, average='macro', zero_division=0))
+                f1 = float(f1_score(self.y_val, y_pred, average='macro', zero_division=0))
+        
+        metrics = {
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "trust_score": self.profile.trust_score,
+            "region_id": self.profile.region_id
+        }
+        
+        return 0.0, len(self.y_val), metrics
 # ============================================================
 # 6. 클라이언트 팩토리
 # ============================================================
@@ -1331,6 +1538,8 @@ def client_fn(cid: str, dataset_name: str, model_type: str,
         return LightweightSVMClient(profile, X_train, y_train, X_val, y_val)
     elif model_type == "secureboost":
         return LightweightSecureBoostClient(profile, X_train, y_train, X_val, y_val)
+    elif model_type == "lightgbm":
+        return LightweightLGBMClient(profile, X_train, y_train, X_val, y_val)
     else:
         train_ds = CustomDataset(X_train, y_train)
         val_ds = CustomDataset(X_val, y_val)
@@ -2458,7 +2667,7 @@ if __name__ == "__main__":
     
     # 모델: 로지스틱 회귀(lr)만 사용 (간단하고 빠름)
     # LSTM(lstm), Random Forest(rf)도 가능하지만 시간이 오래 걸림
-    models = ["vae"] # "lr", "lstm", "rf", "svm", "secureboost", "vae"
+    models = ["lightgbm"] # "lr", "lstm", "rf", "svm", "secureboost", "vae", "lightgbm"
     
     # [2] 연합학습 타입: 두 가지 방식 비교
     # existing_hybrid: 기존 방식 (지역 서버 없음, 에폭5, 학습률0.001)
