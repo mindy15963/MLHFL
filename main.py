@@ -407,12 +407,87 @@ def load_and_preprocess_data(dataset_name: str):
         X = df[feature_cols].values
         y = df['RiskLevel'].values.astype(int)
         num_classes = 2
+    elif dataset_name == "heart_disease":
+        """
+        [Heart Disease UCI 데이터셋]
+        
+        목표: 심장병 예측 (이진 분류)
+        - 0: 정상 (num == 0)
+        - 1: 심장병 있음 (num > 0)
+        
+        특징:
+        - 범주형 변수 많음 (origin, sex, cp, restecg, slope, thal)
+        - 불리언 변수 (fbs, exang)
+        - 결측치 처리 필요
+        - One-Hot Encoding 적용
+        """
+        df = pd.read_csv("./heart_disease_uci.csv")
+        
+        print(f"\n[Heart Disease] 원본 데이터 크기: {df.shape}")
+        print(f"[Heart Disease] 결측치 확인:\n{df.isnull().sum()}")
+        
+        # [1] 타겟 변수 이진화
+        # num: 0 (정상), 1-4 (심장병 정도) → 0 vs 1 이진 분류
+        df['target'] = (df['num'] > 0).astype(int)
+        
+        # [2] 불필요한 컬럼 제거
+        df = df.drop(['id', 'num'], axis=1)
+        
+        # [3] 결측치 처리 전략
+        # 수치형: 중앙값으로 대체
+        # 범주형: 최빈값으로 대체
+        
+        # 수치형 컬럼
+        numeric_cols = ['age', 'trestbps', 'chol', 'thalach', 'oldpeak', 'ca']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df[col].fillna(df[col].median(), inplace=True)
+        
+        # 범주형 컬럼
+        categorical_cols = ['dataset', 'sex', 'cp', 'restecg', 'slope', 'thal']
+        for col in categorical_cols:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.strip().str.lower()
+                df[col].fillna(df[col].mode()[0], inplace=True)
+        
+        # 불리언 컬럼
+        boolean_cols = ['fbs', 'exang']
+        for col in boolean_cols:
+            if col in df.columns:
+                # True/False → 1/0 변환
+                df[col] = df[col].map({True: 1, False: 0, 'True': 1, 'False': 0})
+                df[col].fillna(0, inplace=True)
+                df[col] = df[col].astype(int)
+                
+        missing_cols = [col for col in categorical_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns: {missing_cols}")
+        
+        # [4] One-Hot Encoding (범주형 변수 변환)
+        df_encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=True)
+        
+        # [5] 특성과 타겟 분리
+        X = df_encoded.drop('target', axis=1).values
+        y = df_encoded['target'].values.astype(int)
+        num_classes = 2
+        
+        print(f"[Heart Disease] 전처리 후 크기: X={X.shape}, y={y.shape}")
+        print(f"[Heart Disease] 클래스 분포: 정상={np.sum(y==0)}, 심장병={np.sum(y==1)}")
+        print(f"[Heart Disease] 특성 수: {X.shape[1]} (One-Hot Encoding 적용)")
     else:
         raise ValueError(f"알 수 없는 데이터셋: {dataset_name}")
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
   
-    age_idx = -1 if dataset_name == "diabetes" else 0
+    # [공통] Age 기준 정렬 (Non-IID 시뮬레이션)
+    if dataset_name == "diabetes":
+        age_idx = -1  # Age는 마지막 컬럼
+    elif dataset_name == "maternal":
+        age_idx = 0   # Age는 첫 번째 컬럼
+    elif dataset_name == "heart_disease":
+        age_idx = 0   # age는 첫 번째 수치형 컬럼
+    
     sorted_idx = np.argsort(X[:, age_idx])
     X = X[sorted_idx]
     y = y[sorted_idx]
@@ -2663,11 +2738,11 @@ if __name__ == "__main__":
     
     # [1] 실험 대상 선정
     # 데이터셋: 당뇨병 예측 (diabetes)만 사용 (빠른 실행을 위해)
-    datasets = ["maternal"] # "diabetes", "maternal"도 가능
+    datasets = ["heart_disease"] # "diabetes", "maternal" ,"heart_disease"도 가능
     
     # 모델: 로지스틱 회귀(lr)만 사용 (간단하고 빠름)
     # LSTM(lstm), Random Forest(rf)도 가능하지만 시간이 오래 걸림
-    models = ["lightgbm"] # "lr", "lstm", "rf", "svm", "secureboost", "vae", "lightgbm"
+    models = ["rf"] # "lr", "lstm", "rf", "svm", "secureboost", "vae", "lightgbm"
     
     # [2] 연합학습 타입: 두 가지 방식 비교
     # existing_hybrid: 기존 방식 (지역 서버 없음, 에폭5, 학습률0.001)
@@ -2739,25 +2814,40 @@ if __name__ == "__main__":
                             "status": f"실패: {str(e)[:30]}"
                         })
     
-    # [6] 결과 출력
+    # [6] 결과 출력 및 텍스트 파일 저장
     print("\n" + "="*100)
     print("전체 확장성 실험 결과")
     print("="*100 + "\n")
     
-    print(f"{'클라이언트 수':<12} {'FL 타입':<20} {'정확도':<10} {'정밀도':<10} "
-          f"{'재현율':<10} {'F1':<10} {'시간(초)':<12} {'상태':<15}")
-    print("-"*100)
+    # 텍스트 파일 생성
+    output_file = "experiment_results.txt"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("="*100 + "\n")
+        f.write("전체 확장성 실험 결과\n")
+        f.write("="*100 + "\n\n")
+        
+        header = f"{'클라이언트 수':<12} {'FL 타입':<20} {'정확도':<10} {'정밀도':<10} {'재현율':<10} {'F1':<10} {'시간(초)':<12} {'상태':<15}"
+        print(header)
+        f.write(header + "\n")
+        
+        separator = "-"*100
+        print(separator)
+        f.write(separator + "\n")
+        
+        for result in all_results:
+            if result['status'] == '완료':
+                line = (f"{result['num_clients']:<12} {result['fl_type']:<20} "
+                       f"{result['accuracy']:<10.4f} {result['precision']:<10.4f} "
+                       f"{result['recall']:<10.4f} {result['f1']:<10.4f} "
+                       f"{result['elapsed_time']:<12.2f} {result['status']:<15}")
+            else:
+                line = (f"{result['num_clients']:<12} {result['fl_type']:<20} "
+                       f"{'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<10} "
+                       f"{'N/A':<12} {result['status']:<15}")
+            print(line)
+            f.write(line + "\n")
     
-    for result in all_results:
-        if result['status'] == '완료':
-            print(f"{result['num_clients']:<12} {result['fl_type']:<20} "
-                  f"{result['accuracy']:<10.4f} {result['precision']:<10.4f} "
-                  f"{result['recall']:<10.4f} {result['f1']:<10.4f} "
-                  f"{result['elapsed_time']:<12.2f} {result['status']:<15}")
-        else:
-            print(f"{result['num_clients']:<12} {result['fl_type']:<20} "
-                  f"{'N/A':<10} {'N/A':<10} {'N/A':<10} {'N/A':<10} "
-                  f"{'N/A':<12} {result['status']:<15}")
+    print(f"\n✅ 실험 결과가 '{output_file}'에 저장되었습니다.\n")
     
     # [7] 성능 개선 분석
     print("\n" + "="*100)
