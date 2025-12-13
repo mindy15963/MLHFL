@@ -407,91 +407,96 @@ def load_and_preprocess_data(dataset_name: str):
         X = df[feature_cols].values
         y = df['RiskLevel'].values.astype(int)
         num_classes = 2
+        
     elif dataset_name == "heart_disease":
-        """
-        [Heart Disease UCI 데이터셋]
-        
-        목표: 심장병 예측 (이진 분류)
-        - 0: 정상 (num == 0)
-        - 1: 심장병 있음 (num > 0)
-        
-        특징:
-        - 범주형 변수 많음 (origin, sex, cp, restecg, slope, thal)
-        - 불리언 변수 (fbs, exang)
-        - 결측치 처리 필요
-        - One-Hot Encoding 적용
-        """
         df = pd.read_csv("./heart_disease_uci.csv")
         
         print(f"\n[Heart Disease] 원본 데이터 크기: {df.shape}")
         print(f"[Heart Disease] 결측치 확인:\n{df.isnull().sum()}")
         
         # [1] 타겟 변수 이진화
-        # num: 0 (정상), 1-4 (심장병 정도) → 0 vs 1 이진 분류
         df['target'] = (df['num'] > 0).astype(int)
         
         # [2] 불필요한 컬럼 제거
         df = df.drop(['id', 'num'], axis=1)
         
-        # [3] 결측치 처리 전략
-        # 수치형: 중앙값으로 대체
-        # 범주형: 최빈값으로 대체
-        
-        # 수치형 컬럼
+        # [3] 결측치 처리 - 숫자형
         numeric_cols = ['age', 'trestbps', 'chol', 'thalach', 'oldpeak', 'ca']
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 df[col].fillna(df[col].median(), inplace=True)
         
-        # 범주형 컬럼
+        # [4] 결측치 처리 - 범주형
         categorical_cols = ['dataset', 'sex', 'cp', 'restecg', 'slope', 'thal']
         for col in categorical_cols:
             if col in df.columns:
                 df[col] = df[col].astype(str).str.strip().str.lower()
-                df[col].fillna(df[col].mode()[0], inplace=True)
+                df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else 'unknown', inplace=True)
         
-        # 불리언 컬럼
+        # [5] 결측치 처리 - 불린형
         boolean_cols = ['fbs', 'exang']
         for col in boolean_cols:
             if col in df.columns:
-                # True/False → 1/0 변환
-                df[col] = df[col].map({True: 1, False: 0, 'True': 1, 'False': 0})
+                df[col] = df[col].map({True: 1, False: 0, 'True': 1, 'False': 0, 'true': 1, 'false': 0})
                 df[col].fillna(0, inplace=True)
                 df[col] = df[col].astype(int)
-                
-        missing_cols = [col for col in categorical_cols if col not in df.columns]
-        if missing_cols:
-            raise ValueError(f"Missing columns: {missing_cols}")
         
-        # [4] One-Hot Encoding (범주형 변수 변환)
+        # [6] One-Hot Encoding
         df_encoded = pd.get_dummies(df, columns=categorical_cols, drop_first=True)
         
-        # [5] 특성과 타겟 분리
-        X = df_encoded.drop('target', axis=1).values
+        # ⭐ [핵심] 모든 NaN을 0으로 대체
+        df_encoded = df_encoded.fillna(0)
+        
+        # [7] 타겟 분리
         y = df_encoded['target'].values.astype(int)
+        X_df = df_encoded.drop('target', axis=1)
+        
+        # ⭐ [핵심] DataFrame → NumPy 변환 전 타입 확인 및 변환
+        # 모든 컬럼을 명시적으로 float64로 변환
+        for col in X_df.columns:
+            X_df[col] = pd.to_numeric(X_df[col], errors='coerce')
+        
+        # 다시 한번 NaN 제거
+        X_df = X_df.fillna(0)
+        
+        # NumPy 배열로 변환
+        X = X_df.to_numpy(dtype=np.float64)
+        
+        # ⭐ [최종 검증] NaN 확인
+        if np.isnan(X).any():
+            print(f"[CRITICAL] X에 NaN 발견! 0으로 강제 대체합니다.")
+            X = np.nan_to_num(X, nan=0.0)
+        
         num_classes = 2
         
         print(f"[Heart Disease] 전처리 후 크기: X={X.shape}, y={y.shape}")
         print(f"[Heart Disease] 클래스 분포: 정상={np.sum(y==0)}, 심장병={np.sum(y==1)}")
         print(f"[Heart Disease] 특성 수: {X.shape[1]} (One-Hot Encoding 적용)")
+        print(f"[Heart Disease] NaN 확인: {np.isnan(X).sum()} (0이어야 정상)")
+        print(f"[Heart Disease] X 데이터 타입: {X.dtype}")
+        
     else:
         raise ValueError(f"알 수 없는 데이터셋: {dataset_name}")
+    
+    # [공통] StandardScaler 적용
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
   
     # [공통] Age 기준 정렬 (Non-IID 시뮬레이션)
     if dataset_name == "diabetes":
-        age_idx = -1  # Age는 마지막 컬럼
+        age_idx = -1
     elif dataset_name == "maternal":
-        age_idx = 0   # Age는 첫 번째 컬럼
+        age_idx = 0
     elif dataset_name == "heart_disease":
-        age_idx = 0   # age는 첫 번째 수치형 컬럼
+        age_idx = 0
     
     sorted_idx = np.argsort(X[:, age_idx])
     X = X[sorted_idx]
     y = y[sorted_idx]
+    
     return X, y, num_classes
+
 def distribute_data_to_clients(X, y, num_clients: int, min_samples: int = 5):
     """
     클라이언트에게 데이터를 분배하되, 각 클라이언트가 최소 2개 클래스를 받도록 보장
@@ -2742,7 +2747,7 @@ if __name__ == "__main__":
     
     # 모델: 로지스틱 회귀(lr)만 사용 (간단하고 빠름)
     # LSTM(lstm), Random Forest(rf)도 가능하지만 시간이 오래 걸림
-    models = ["rf"] # "lr", "lstm", "rf", "svm", "secureboost", "vae", "lightgbm"
+    models = ["secureboost"] # "lr", "lstm", "rf", "svm", "secureboost", "vae", "lightgbm"
     
     # [2] 연합학습 타입: 두 가지 방식 비교
     # existing_hybrid: 기존 방식 (지역 서버 없음, 에폭5, 학습률0.001)
