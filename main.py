@@ -2747,7 +2747,7 @@ if __name__ == "__main__":
     
     # 모델: 로지스틱 회귀(lr)만 사용 (간단하고 빠름)
     # LSTM(lstm), Random Forest(rf)도 가능하지만 시간이 오래 걸림
-    models = ["secureboost"] # "lr", "lstm", "rf", "svm", "secureboost", "vae", "lightgbm"
+    models = ["vae"] # "lr", "lstm", "rf", "svm", "secureboost", "vae", "lightgbm"
     
     # [2] 연합학습 타입: 두 가지 방식 비교
     # existing_hybrid: 기존 방식 (지역 서버 없음, 에폭5, 학습률0.001)
